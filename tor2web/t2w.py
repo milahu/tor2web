@@ -22,6 +22,8 @@ import re
 import signal
 import socket
 from cgi import parse_header
+# TODO https://pypi.org/project/legacy-cgi/
+#from legacy_cgi import parse_header
 from functools import partial
 from io import BytesIO
 from random import choice
@@ -36,7 +38,7 @@ from twisted.internet.endpoints import TCP4ClientEndpoint, SSL4ClientEndpoint
 from twisted.internet.task import LoopingCall
 from twisted.protocols.policies import WrappingFactory
 from twisted.python import log, logfile
-from twisted.python.compat import networkString, intToBytes
+from twisted.python.compat import networkString
 from twisted.python.failure import Failure
 from twisted.python.filepath import FilePath
 from twisted.spread import pb
@@ -200,7 +202,8 @@ class T2WPP(protocol.ProcessProtocol):
 
 def spawnT2W(father, childFDs, fds_https, fds_http):
     child_env = os.environ.copy()
-    child_env['T2W_FDS_HTTPS'] = fds_https
+    # TODO if not config.disable_ssl:
+    #child_env['T2W_FDS_HTTPS'] = fds_https
     child_env['T2W_FDS_HTTP'] = fds_http
 
     return reactor.spawnProcess(T2WPP(father, childFDs, fds_https, fds_http),
@@ -258,6 +261,10 @@ class BodyStreamer(protocol.Protocol):
         self._streamfunction = streamfunction
 
     def dataReceived(self, data):
+        # FIXME data is gzip compressed
+        #print("BodyStreamer dataReceived", "data", len(data), repr(data))
+        print("BodyStreamer dataReceived", "data", len(data), data.hex())
+        #print("BodyStreamer dataReceived", "len(data)", len(data))
         self._streamfunction(data)
 
     def connectionLost(self, reason):
@@ -309,7 +316,7 @@ class Agent(client.Agent):
 
     def request(self, method, uri, headers, bodyProducer=None):
         for key, values in headers.getAllRawHeaders():
-            fixed_values = [re_sub(rexp['w2t'], b'http://\2.onion', value) for value in values]
+            fixed_values = [re_sub(rexp['w2t'], rb'http://\2.onion', value) for value in values]
             headers.setRawHeaders(key, fixed_values)
 
         return client.Agent.request(self, method, uri, headers, bodyProducer)
@@ -474,25 +481,44 @@ class T2WRequest(http.Request):
         """
         return data.group(1) + banner
 
+    # TODO refactor handleFixPart and handleFixEnd
+
     def handleFixPart(self, data):
+        print("handleFixPart", "self.obj.server_response_is_gzip", repr(self.obj.server_response_is_gzip))
         if self.obj.server_response_is_gzip:
             data = self.unzip(data)
 
         data = self.stream + data
 
+        #print("handleFixPart", "len(data)", len(data))
+        print("handleFixPart", "data", len(data), repr(data))
+        print("handleFixPart", "config.bufsize", config.bufsize)
+        # handleFixPart config.bufsize 4096
+
         if len(data) >= config.bufsize * 2:
             if self.obj.special_content == 'HTML':
+                # TODO case-insensitive search for "<body"
+                # TODO if options.inject_header
+                """
                 if not self.header_injected and data.find(b"<body") != -1:
                     data = re.sub(rexp['body'], partial(self.add_banner, self.banner), data)
                     self.header_injected = True
+                """
 
             if config.avoid_rewriting_visible_content and self.obj.special_content == 'HTML':
+                print("handleFixPart rewriting_visible_content")
+                # disable javascript
+                # TODO also remove event listeners from html attributes
+                #   <span onclick="alert('evil')">click me</span>
+                # TODO maybe use a library to sanitize html
+                data = re_sub(b"<script.*?</script>", b"", data)
                 data = re_sub(rexp['html_t2w'],
-                              b'\1\2' + self.proto + b'\3.' + self.var['basehost'].encode('utf-8') + self.port.encode(
-                                  'utf-8') + b'\4', data)
+                              rb'\1\2' + self.proto + rb'\3.' + self.var['basehost'].encode('utf-8') + self.port.encode(
+                                  'utf-8') + rb'\4', data)
             else:
+                print("handleFixPart not rewriting_visible_content")
                 data = re_sub(rexp['t2w'],
-                              self.proto + b'\2.' + self.var['basehost'].encode('utf-8') + self.port.encode('utf-8'),
+                              self.proto + rb'\2.' + self.var['basehost'].encode('utf-8') + self.port.encode('utf-8'),
                               data)
 
         if len(data) >= config.bufsize * 2:
@@ -503,24 +529,46 @@ class T2WRequest(http.Request):
             self.stream = data
 
     def handleFixEnd(self, data):
+
+        #print("handleFixEnd", "len(data)", len(data)) # 0
+
+        #print("handleFixEnd", "self.obj.server_response_is_gzip", repr(self.obj.server_response_is_gzip))
+
         if self.obj.server_response_is_gzip:
             data = self.unzip(data, True)
 
         data = self.stream + data
 
-        if len(data) >= config.bufsize * 2:
+        print("handleFixEnd data", len(data), repr(data))
+
+        # len(data) == 5628
+        # config.bufsize * 2 == 2 * 4096 == 8192
+
+        #if len(data) >= config.bufsize * 2: # why ?!
+        if True:
             if self.obj.special_content == 'HTML':
+                # TODO case-insensitive search for "<body"
+                # TODO if options.inject_header
+                """
                 if not self.header_injected and data.find(b"<body") != -1:
                     data = re.sub(rexp['body'], partial(self.add_banner, self.banner), data)
                     self.header_injected = True
+                """
 
-            if config.avoid_rewriting_visible_content and self.obj.special_content == 'HTML':
+            #if config.avoid_rewriting_visible_content and self.obj.special_content == 'HTML':
+            if self.obj.special_content == 'HTML':
+                print("handleFixEnd rewriting_visible_content")
+
+                # disable javascript
+                data = re_sub(b"<script.*?</script>", b"", data)
+
                 data = re_sub(rexp['html_t2w'],
-                              b'\1\2' + self.proto + b'\3.' + self.var['basehost'].encode('utf-8') + self.port.encode(
-                                  'utf-8') + b'\4', data)
+                              rb'\1\2' + self.proto + rb'\3.' + self.var['basehost'].encode('utf-8') + self.port.encode(
+                                  'utf-8') + rb'\4', data)
             else:
+                print("handleFixEnd not rewriting_visible_content")
                 data = re_sub(rexp['t2w'],
-                              self.proto + b'\2.' + self.var['basehost'].encode('utf-8') + self.port.encode('utf-8'),
+                              self.proto + rb'\2.' + self.var['basehost'].encode('utf-8') + self.port.encode('utf-8'),
                               data)
 
         self.forwardData(self.handleCleartextForwardPart(data, True), True)
@@ -542,6 +590,7 @@ class T2WRequest(http.Request):
         return data
 
     def handleForwardPart(self, data):
+        print("handleForwardPart", "self.obj.server_response_is_gzip", repr(self.obj.server_response_is_gzip))
         if self.obj.server_response_is_gzip:
             data = self.handleGzippedForwardPart(data)
         else:
@@ -550,6 +599,7 @@ class T2WRequest(http.Request):
         self.forwardData(data)
 
     def handleForwardEnd(self, data):
+        print("handleForwardEnd", "self.obj.server_response_is_gzip", repr(self.obj.server_response_is_gzip))
         if self.obj.server_response_is_gzip:
             data = self.handleGzippedForwardPart(data, True)
         else:
@@ -580,10 +630,10 @@ class T2WRequest(http.Request):
                 self.setHeader(b'content-encoding', b'gzip')
                 data = self.zip(data, True)
 
-            self.setHeader(b'content-length', intToBytes(len(data)))
+            self.setHeader(b'content-length', b'%d' % len(data))
             self.write(data)
         else:
-            self.setHeader(b'content-length', intToBytes(0))
+            self.setHeader(b'content-length', b'0')
 
         self.finish()
 
@@ -606,13 +656,19 @@ class T2WRequest(http.Request):
 
         try:
             if self.decoderGzip is None:
+                print("unzip zlib.decompressobj ...")
                 self.decoderGzip = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                print("unzip zlib.decompressobj ok")
 
             if data:
+                print("unzip self.decoderGzip.decompress ...")
                 data1 = self.decoderGzip.decompress(data)
+                print(f"unzip self.decoderGzip.decompress ok: -> {repr(data1)}")
 
             if end:
+                print("unzip self.decoderGzip.flush ...")
                 data2 = self.decoderGzip.flush()
+                print(f"unzip self.decoderGzip.flush ok: -> {repr(data2)}")
 
         except:
             pass
@@ -706,6 +762,8 @@ class T2WRequest(http.Request):
             elif len(config.mirror) == 1:
                 self.var['mirror'] = config.mirror[0]
 
+        # TODO if not config.disable_ssl
+        """
         # we serve contents only over HTTPS
         if not self.isSecure() and (config.transport != 'HTTP'):
             if config.listen_port_https == 443:
@@ -716,6 +774,7 @@ class T2WRequest(http.Request):
 
             self.finish()
             return
+        """
 
         # check if the user is using Tor
         self.obj.client_ip = self.getClientIP()
@@ -928,11 +987,15 @@ class T2WRequest(http.Request):
             self.proxy_d.addErrback(self.handleError)
 
     def cbResponse(self, response):
+
         self.proxy_response = response
         if 600 <= int(response.code) <= 699:
+            print("cbResponse", "error", response.code)
             self.setResponseCode(500)
             self.var['errorcode'] = int(response.code) - 600
             return flattenString(self, templates['error_sock.tpl']).addCallback(self.writeContent)
+
+        print("cbResponse", "code", response.code, "length", response.length)
 
         self.setResponseCode(response.code)
         self.processResponseHeaders(response.headers)
@@ -941,9 +1004,12 @@ class T2WRequest(http.Request):
 
         # if there's no response, we're done.
         if not response.length:
-            self.setHeader(b'content-length', intToBytes(0))
+            print("cbResponse", "no response")
+            self.setHeader(b'content-length', b'0')
             self.finish()
             return defer.succeed
+
+        print("cbResponse self.obj.special_content", repr(self.obj.special_content))
 
         finished = defer.Deferred()
         if self.obj.special_content:
@@ -962,20 +1028,37 @@ class T2WRequest(http.Request):
         # in case of multiple occurrences we evaluate only the first
         valueLower = values[0].lower()
 
+        print("handleHeader", "keyLower", keyLower, "valueLower", valueLower)
+
+        # handleHeader keyLower b'content-encoding' valueLower b'gzip'
+
         if keyLower == b'transfer-encoding' and valueLower == b'chunked':
             # this header needs to be stripped
             return
 
         elif keyLower == b'content-encoding' and valueLower == b'gzip':
+            #print("handleHeader", "keyLower", keyLower, "valueLower", valueLower)
             self.obj.server_response_is_gzip = True
             # this header needs to be stripped
             return
 
         elif keyLower == b'content-type':
+
+            print("handleHeader content-type", valueLower)
+
             if valueLower.startswith(b'text/html'):
                 self.obj.special_content = 'HTML'
             elif valueLower.startswith(b'application/javascript'):
                 self.obj.special_content = 'JS'
+
+                # TODO disable javascript
+                # TODO dont request js in the first place
+                self.responseHeaders.setRawHeaders(b"content-length", [b"0"])
+                self.setResponseCode(500)
+                self.setHeader(b'content-length', b'0')
+                self.finish()
+                return defer.succeed
+
             elif valueLower.startswith(b'text/css'):
                 self.obj.special_content = 'CSS'
             elif valueLower.startswith(b'text/xml'):
@@ -987,12 +1070,12 @@ class T2WRequest(http.Request):
             return
 
         elif keyLower == 'set-cookie':
-            values = [re_sub(rexp['set_cookie_t2w'], b'domain=\1.' + config.basehost.encode('utf-8') + b'\2', x) for x
+            values = [re_sub(rexp['set_cookie_t2w'], rb'domain=\1.' + config.basehost.encode('utf-8') + rb'\2', x) for x
                       in values]
 
         else:
             values = [
-                re_sub(rexp['t2w'], self.proto + b'\2.' + config.basehost.encode('utf-8') + self.port.encode('utf-8'),
+                re_sub(rexp['t2w'], self.proto + rb'\2.' + config.basehost.encode('utf-8') + self.port.encode('utf-8'),
                        x) for x in values]
 
         self.responseHeaders.setRawHeaders(key, values)
